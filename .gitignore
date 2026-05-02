@@ -1,0 +1,16 @@
+# Build output
+/gokubedump
+/gokubedump-linux-amd64
+/kubedumper
+
+# Dump output
+/dump/
+*.tar.gz
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
