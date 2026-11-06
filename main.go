@@ -58,6 +58,20 @@ func main() {
 		}
 	}
 
+	// Refuse to mix a new dump with leftovers: files for objects deleted since
+	// an earlier run would otherwise linger and be re-applied or archived.
+	if entries, err := os.ReadDir(outDir); err == nil {
+		if len(entries) > 0 {
+			log.Fatalf("output directory %q is not empty; remove it or choose another -out", outDir)
+		}
+	} else if !os.IsNotExist(err) {
+		log.Fatalf("output directory %q: %v", outDir, err)
+	}
+
+	// failures counts everything that makes the dump incomplete; any failure
+	// results in a non-zero exit status.
+	var failures atomic.Int64
+
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatal(err)
@@ -80,7 +94,8 @@ func main() {
 		if !discovery.IsGroupDiscoveryFailedError(err) || len(lists) == 0 {
 			log.Fatalf("discovery: %v", err)
 		}
-		log.Printf("discovery warning: %v", err)
+		log.Printf("discovery: %v", err)
+		failures.Add(1)
 	}
 
 	type job struct {
@@ -160,6 +175,7 @@ func main() {
 			list, err := dyn.Resource(j.gvr).List(context.TODO(), metav1.ListOptions{ResourceVersion: "0"})
 			if err != nil {
 				log.Printf("list %s: %v", j.label, err)
+				failures.Add(1)
 				return
 			}
 			written := 0
@@ -180,6 +196,7 @@ func main() {
 				}
 				if err := ensureDir(dir); err != nil {
 					log.Printf("mkdir %s: %v", dir, err)
+					failures.Add(1)
 					continue
 				}
 
@@ -189,10 +206,12 @@ func main() {
 				data, err := yaml.Marshal(item.Object)
 				if err != nil {
 					log.Printf("marshal %s: %v", path, err)
+					failures.Add(1)
 					continue
 				}
 				if err := os.WriteFile(path, data, 0o644); err != nil {
 					log.Printf("write %s: %v", path, err)
+					failures.Add(1)
 					continue
 				}
 				written++
@@ -211,8 +230,14 @@ func main() {
 		}
 		if err := os.RemoveAll(outDir); err != nil {
 			log.Printf("remove source: %v", err)
+			failures.Add(1)
 		}
 		log.Printf("archived to %s", archivePath)
+	}
+
+	if n := failures.Load(); n > 0 {
+		log.Printf("dump is incomplete: %d error(s), see log above", n)
+		os.Exit(1)
 	}
 }
 
