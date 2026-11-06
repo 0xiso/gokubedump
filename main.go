@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -43,6 +44,20 @@ func main() {
 	flag.IntVar(&parallelism, "p", 32, "parallel workers")
 	flag.Parse()
 
+	if parallelism < 1 {
+		log.Fatalf("-p must be at least 1, got %d", parallelism)
+	}
+	outDir = filepath.Clean(outDir)
+	if archiveTo != "" {
+		inside, err := isWithin(outDir, archiveTo)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if inside {
+			log.Fatalf("-archive-to %q must not be inside -out %q (the source is removed after archiving)", archiveTo, outDir)
+		}
+	}
+
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatal(err)
@@ -62,12 +77,16 @@ func main() {
 	lists, err := disco.ServerPreferredResources()
 	if err != nil {
 		// partial discovery can return a non-nil error with usable lists
+		if !discovery.IsGroupDiscoveryFailedError(err) || len(lists) == 0 {
+			log.Fatalf("discovery: %v", err)
+		}
 		log.Printf("discovery warning: %v", err)
 	}
 
 	type job struct {
 		gvr        schema.GroupVersionResource
 		namespaced bool
+		label      string // resource name used in filenames and logs
 	}
 	var jobs []job
 	for _, l := range lists {
@@ -92,6 +111,20 @@ func main() {
 				gvr:        schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: r.Name},
 				namespaced: r.Namespaced,
 			})
+		}
+	}
+
+	// The same plural can exist in several groups (e.g. core "nodes" and
+	// metrics.k8s.io "nodes"). Qualify non-core ones with their group so their
+	// files do not overwrite each other.
+	groupsByName := map[string]int{}
+	for _, j := range jobs {
+		groupsByName[j.gvr.Resource]++
+	}
+	for i := range jobs {
+		jobs[i].label = jobs[i].gvr.Resource
+		if groupsByName[jobs[i].gvr.Resource] > 1 && jobs[i].gvr.Group != "" {
+			jobs[i].label += "." + jobs[i].gvr.Group
 		}
 	}
 
@@ -126,7 +159,7 @@ func main() {
 			// for a manifest dump and dramatically reduces apiserver+etcd load.
 			list, err := dyn.Resource(j.gvr).List(context.TODO(), metav1.ListOptions{ResourceVersion: "0"})
 			if err != nil {
-				log.Printf("list %s: %v", j.gvr.Resource, err)
+				log.Printf("list %s: %v", j.label, err)
 				return
 			}
 			written := 0
@@ -152,7 +185,7 @@ func main() {
 
 				clean(item)
 
-				path := filepath.Join(dir, fmt.Sprintf("%s_%s.yaml", j.gvr.Resource, item.GetName()))
+				path := filepath.Join(dir, fmt.Sprintf("%s_%s.yaml", j.label, fileSafe(item.GetName())))
 				data, err := yaml.Marshal(item.Object)
 				if err != nil {
 					log.Printf("marshal %s: %v", path, err)
@@ -165,7 +198,7 @@ func main() {
 				written++
 			}
 			total.Add(int64(written))
-			log.Printf("%-40s %d items", j.gvr.Resource, written)
+			log.Printf("%-40s %d items", j.label, written)
 		}(j)
 	}
 	wg.Wait()
@@ -181,6 +214,34 @@ func main() {
 		}
 		log.Printf("archived to %s", archivePath)
 	}
+}
+
+// isWithin reports whether path is dir itself or located below it.
+func isWithin(dir, path string) (bool, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil {
+		return false, nil // e.g. different volumes on Windows
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
+}
+
+// fileSafe makes an object name usable as a filename on every OS. Names like
+// "system:controller:job-controller" are valid in Kubernetes but ':' is not
+// allowed on Windows. '%' cannot appear in object names, so the escape is
+// collision-free.
+func fileSafe(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ReplaceAll(name, ":", "%3A")
+	}
+	return name
 }
 
 func archive(srcDir, destDir string) (archivePath string, err error) {
@@ -229,7 +290,10 @@ func archive(srcDir, destDir string) (archivePath string, err error) {
 		if err != nil {
 			return err
 		}
-		hdr.Name = rel
+		hdr.Name = filepath.ToSlash(rel)
+		if d.IsDir() {
+			hdr.Name += "/"
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
@@ -269,7 +333,12 @@ func clean(u *unstructured.Unstructured) {
 
 	switch u.GetKind() {
 	case "Service":
-		for _, k := range []string{"clusterIP", "clusterIPs", "ipFamilies", "ipFamilyPolicy", "healthCheckNodePort"} {
+		fields := []string{"ipFamilies", "ipFamilyPolicy", "healthCheckNodePort"}
+		// clusterIP: None marks a headless Service and must survive re-apply.
+		if ip, _, _ := unstructured.NestedString(m, "spec", "clusterIP"); ip != "None" {
+			fields = append(fields, "clusterIP", "clusterIPs")
+		}
+		for _, k := range fields {
 			unstructured.RemoveNestedField(m, "spec", k)
 		}
 		if ports, ok, _ := unstructured.NestedSlice(m, "spec", "ports"); ok {

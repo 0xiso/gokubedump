@@ -71,6 +71,11 @@ dump/
     └── ...
 ```
 
+Files are named `<resource>_<name>.yaml`. When the same resource name exists in
+more than one API group (for example core `nodes` and `metrics.k8s.io` `nodes`),
+the non-core ones are written as `<resource>.<group>_<name>.yaml` so they do not
+overwrite each other.
+
 Each file is the original object minus:
 
 - `metadata`: `creationTimestamp`, `deletionGracePeriodSeconds`,
@@ -78,8 +83,9 @@ Each file is the original object minus:
   `ownerReferences`, `resourceVersion`, `selfLink`, `uid`
 - `status`
 - `metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]`
-- Service: `clusterIP`, `clusterIPs`, `ipFamilies`, `ipFamilyPolicy`,
-  `healthCheckNodePort`, per-port `nodePort`
+- Service: `clusterIP`, `clusterIPs` (kept when `None`, so headless Services
+  stay headless), `ipFamilies`, `ipFamilyPolicy`, `healthCheckNodePort`,
+  per-port `nodePort`
 - ServiceAccount: `secrets`
 - PersistentVolumeClaim: `spec.volumeName`
 - PersistentVolume: `spec.claimRef`
